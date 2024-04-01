@@ -350,6 +350,9 @@ contains
             ! Longitude centers [deg]
             XMid(I, J) = (DX * (I-1)) - 180.0_r8
 
+            ! hplin debug: offset XMid so XEdge(1) is -180.0 exactly to see it helps b4b
+            !XMid(I, J) = (DX * (I-1+0.5)) - 180.0_r8
+
             ! Latitude centers [deg]
             YMid(I, J) = (DY * (J-1)) -  90.0_r8
 
@@ -618,10 +621,10 @@ contains
         enddo
 
         ! For root task write out a debug output to make sure
-        if(masterproc) then
-            write(iulog,*) ">> HEMCO: Root task committing to sub-decomp"
-            write(iulog,*) ">> my_IM,JM,IS,IE,JS,JE", my_IM, my_JM, my_IS, my_IE, my_JS, my_JE
-        endif
+        !if(masterproc) then
+            !write(iulog,*) ">> HEMCO: Root task committing to sub-decomp"
+            write(6,*) "HEMCO: my_IM,JM,IS,IE,JS,JE", my_IM, my_JM, my_IS, my_IE, my_JS, my_JE
+        !endif
 
         !-----------------------------------------------------------------------
         ! Distribute among parallelization in MPI 3: Distribute all-to-all task info

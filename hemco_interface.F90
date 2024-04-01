@@ -768,6 +768,11 @@ contains
         HcoState%Grid%YSin%Val         => YSin   (my_IS:my_IE  , my_JS:my_JE+1)
         HcoState%Grid%AREA_M2%Val      => AREA_M2(my_IS:my_IE  , my_JS:my_JE  )
 
+        ! Debug only
+        write(6,*) "hcinit", my_IM, my_JM, LM, "diml", my_IS, my_IE, my_JS, my_JE
+        write(6,*) "hcinit: xedges", HcoState%Grid%XEdge%Val(:,1)
+        write(6,*) "hcinit: yedges", HcoState%Grid%YEdge%Val(1,:)
+
         ! Debug
         ! write(6,*) "HCOI_Chunk_Init XMid, YMid(1,1)", HcoState%Grid%XMid%Val(1,1), &
         !                                               HcoState%Grid%YMid%Val(1,1), &
@@ -896,6 +901,11 @@ contains
         ! Additional exports: Verify if we need to add additional exports
         ! for integration with CESM-GC. (hplin, 4/15/20)
         !-----------------------------------------------------------------------
+
+        ! debug only
+        call addfld('HCO_EDGAR_TODNOX', horiz_only, 'I', '1',                &
+                        trim(exportDesc),                                &
+                        gridname='physgrid')
 
         ! Do additional exports!
         ! Removed debug into history output because it does not seem necessary (hplin, 9/23/22)
@@ -1651,6 +1661,26 @@ contains
             doExport   = (FIRST .or. associated(HcoState%Spc(spcID)%Emis%Val))
             ! if(masterproc) write(iulog,*) "HEMCO_CESM: Begin exporting " // trim(exportName)
 
+            ! --- Debug only ---
+            if(trim(HcoConfig%ModelSpc(spcID)%SpcName) .eq. 'NO') then
+                if(associated(HcoState%Spc(spcID)%Emis%Val)) then
+                    ! if(HcoConfig%ModelSpc(spcID)%DimMax .eq. 3) then
+                        write(6,*) "hcdebug: writing out lvl-sfc at present dt"
+                        do i = 1, HI
+                            write(6,*) "hcdebug: (i=", i, ") ", HcoState%Spc(spcID)%Emis%Val(i,1:HJ,1)
+                        enddo
+                    ! elseif(HcoConfig%ModelSpc(spcID)%DimMax .eq. 2) then
+                    !     write(6,*) "hcdebug: writing out 2-D at present dt"
+                    !     do i = 1:HI
+                    !         write(6,*) "hcdebug(i=", i, ") ", HcoState%Spc(spcID)%Emis%Val(i,1:HJ,1)
+                    !     enddo
+                    ! endif
+                else
+                    write(6,*) "hcdebug: no emis found for ", trim(HcoConfig%ModelSpc(spcID)%SpcName)
+                endif
+            endif
+            ! -- / Debug only --
+
             ! Get HEMCO emissions flux [kg/m2/s].
             ! For performance optimization ... tap into HEMCO structure directly (ugly ugly)
             ! No need to flip vertical here. The regridder will do it for us
@@ -1667,8 +1697,15 @@ contains
                     call HCO_Grid_HCO2CAM_3D(exportFldHco, exportFldCAM)
 
                     ! Debug only: Output data for debug and comparing against logs
-                    ! if(masterproc) write(iulog, *) "HEMCO_CESM debug ", trim(exportName), " HCO min max sum ", minval(exportFldHco(my_IS:my_IE,my_JS:my_JE,1:LM)), maxval(exportFldHco(my_IS:my_IE,my_JS:my_JE,1:LM)), sum(exportFldHco(my_IS:my_IE,my_JS:my_JE,1:LM))
-                    ! if(masterproc) write(iulog, *) "HEMCO_CESM debug ", trim(exportName), " CAM min max sum ", minval(exportFldCAM), maxval(exportFldCAM), sum(exportFldCAM)
+                    if(masterproc) write(iulog, *) "hcdebug2 ", trim(exportName), " HCO min max sum ", minval(exportFldHco(my_IS:my_IE,my_JS:my_JE,1:LM)), maxval(exportFldHco(my_IS:my_IE,my_JS:my_JE,1:LM)), sum(exportFldHco(my_IS:my_IE,my_JS:my_JE,1:LM))
+                    if(masterproc) write(iulog, *) "hcdebug2 ", trim(exportName), " CAM min max sum ", minval(exportFldCAM), maxval(exportFldCAM), sum(exportFldCAM)
+
+                    ! --- Debug only ---
+                    ! if(trim(HcoConfig%ModelSpc(spcID)%SpcName) .eq. 'NO') then
+                    !     write(6,*) "hcdebug: c writing out cam-mesh at present dt"
+                    !     write(6,*) "hcdebug: c ", exportFldCAM(LM,:)
+                    ! endif
+                    ! -- / Debug only --
                 elseif(HcoConfig%ModelSpc(spcID)%DimMax .eq. 2) then
                     ! Zero out quantities first
                     exportFldHco2(:,:) = 0.0_r8
@@ -1682,8 +1719,8 @@ contains
                     call HCO_Grid_HCO2CAM_2D(exportFldHco2, exportFldCAM2)
 
                     ! Debug only: Output data for debug and comparing against logs
-                    ! if(masterproc) write(iulog, *) "HEMCO_CESM debug ", trim(exportName), " HCO min max sum ", minval(exportFldHco2(my_IS:my_IE,my_JS:my_JE)), maxval(exportFldHco2(my_IS:my_IE,my_JS:my_JE)), sum(exportFldHco2(my_IS:my_IE,my_JS:my_JE))
-                    ! if(masterproc) write(iulog, *) "HEMCO_CESM debug ", trim(exportName), " CAM min max sum ", minval(exportFldCAM2), maxval(exportFldCAM2), sum(exportFldCAM2)
+                    ! if(masterproc) write(iulog, *) "hcdebug2 ", trim(exportName), " HCO min max sum ", minval(exportFldHco2(my_IS:my_IE,my_JS:my_JE)), maxval(exportFldHco2(my_IS:my_IE,my_JS:my_JE)), sum(exportFldHco2(my_IS:my_IE,my_JS:my_JE))
+                    ! if(masterproc) write(iulog, *) "hcdebug2 ", trim(exportName), " CAM min max sum ", minval(exportFldCAM2), maxval(exportFldCAM2), sum(exportFldCAM2)
                 else
                     ASSERT_(.false.)
                 endif
@@ -1886,6 +1923,27 @@ contains
                 call HCO_Export_Pbuf_CAM2D(exportNameTmp, -1, exportFldCAM2)
             endif
             Ptr2D => NULL()
+        endif
+
+        !-- DEBUG only - custom exports for b4b debug (hplin, 3/29/24)
+        ! EDGAR_TODNOX
+        call HCO_GetPtr(HcoState, 'EDGAR_TODNOX', Ptr2D, HMRC, FOUND=FND)
+        exportFldCAM2(:)   = 0.0_r8
+        if(FIRST) then
+            call HCO_Export_History_CAM2D('HCO_EDGAR_TODNOX', exportFldCAM2)
+        else
+            if(HMRC == HCO_SUCCESS .and. FND) then
+                do i = 1, HI
+                    write(6,*) "hcdebug: (edgar, i=", i, ") ", Ptr2D(i,:)
+                enddo
+
+                ! write data
+                exportFldHco2(:,:) = Ptr2D(:,:)
+                call HCO_Grid_HCO2CAM_2D(exportFldHco2, exportFldCAM2)
+                call HCO_Export_History_CAM2D('HCO_EDGAR_TODNOX', exportFldCAM2)
+            else
+                write(6,*) "hcdebug: err: no EDGAR_TODNOX"
+            endif
         endif
 
         !-----------------------------------------------------------------------
