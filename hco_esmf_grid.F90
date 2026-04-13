@@ -43,6 +43,7 @@ module hco_esmf_grid
 ! !PUBLIC MEMBER FUNCTIONS:
 !
     public        :: HCO_Grid_Init
+    public        :: HCO_Grid_Init_Direct             ! Direct-mode init (physics columns)
     public        :: HCO_Grid_UpdateRegrid
 
     public        :: HCO_Grid_HCO2CAM_2D             ! Regrid HEMCO to CAM mesh on 2D field
@@ -180,6 +181,10 @@ module hco_esmf_grid
     integer, public, protected :: my_ID_I, my_ID_J   ! mytidi, mytidj coord for current task
 
     integer, public, protected :: my_CE              ! # of CAM ncols in this task
+
+    ! Direct mode flag: when .true., HcoState grid IS the physics grid (ncol x 1),
+    ! bypassing the rectilinear intermediate grid entirely. Set during initialization.
+    logical, public, protected :: direct_mode = .false.
 
     type HCO_Task
         integer  :: ID          ! identifier
@@ -713,6 +718,191 @@ contains
 !------------------------------------------------------------------------------
 !BOP
 !
+! !IROUTINE: HCO_Grid_Init_Direct
+!
+! !DESCRIPTION: Subroutine HCO\_Grid\_Init\_Direct initializes the HEMCO grid
+!  for direct-to-physics-grid mode. Instead of constructing a rectilinear
+!  intermediate grid, HcoState grid represents the CAM physics columns
+!  (NX=ncol, NY=1). This eliminates the intermediate grid overhead that is
+!  particularly wasteful on regionally-refined grids.
+!
+!  This routine must be called AFTER the CAM physics mesh is available
+!  (i.e., after HCO\_Grid\_UpdateRegrid computes my\_CE).
+!\\
+!\\
+! !INTERFACE:
+!
+    subroutine HCO_Grid_Init_Direct( nPET_in, RC )
+!
+! !USES:
+!
+        use cam_logfile,        only: iulog
+        use spmd_utils,         only: masterproc, iam
+        use spmd_utils,         only: CAM_mpicom => mpicom
+
+        use shr_const_mod,      only: pi => shr_const_pi
+        use shr_const_mod,      only: Re => shr_const_rearth
+
+        use hycoef,             only: ps0, hyai, hybi
+        use ppgrid,             only: pver, begchunk, endchunk
+        use phys_grid,          only: get_ncols_p, get_rlon_all_p, get_rlat_all_p, get_area_all_p
+        use ppgrid,             only: pcols
+
+        use ESMF,               only: ESMF_MeshGet, ESMF_KIND_R8
+        use hco_esmf_regrid_cache, only: HCO_RegridCache_Init, HcoDirectMode
+!
+! !INPUT PARAMETERS:
+!
+        integer, intent(in)         :: nPET_in
+        integer, intent(inout)      :: RC
+!
+! !REVISION HISTORY:
+!  09 Apr 2026 - H.P. Lin    - Initial version
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+        character(len=*), parameter :: subname = 'HCO_Grid_Init_Direct'
+        integer  :: I, L, chnk, col, dindex, ncols
+        real(r8) :: PI_180
+        real(r8) :: lonCAM_R(pcols), latCAM_R(pcols), areaCAM_R(pcols)
+
+        PI_180 = pi / 180.0_r8
+
+        ! Enable direct mode
+        direct_mode = .true.
+
+        ! Reset CAM atmospheric ID
+        cam_last_atm_id = -999
+
+        nPET = nPET_in
+
+        !-----------------------------------------------------------------------
+        ! Vertical grid (same as legacy mode)
+        !-----------------------------------------------------------------------
+        LM = pver
+        allocate(Ap(LM + 1), STAT=RC)
+        ASSERT_(RC==0)
+        allocate(Bp(LM + 1), STAT=RC)
+        ASSERT_(RC==0)
+
+        ! Flip vertical: HEMCO level 1 = surface, CAM level 1 = TOA
+        do L = 1, (LM+1)
+            Ap(L) = hyai(LM+2-L) * ps0
+            Bp(L) = hybi(LM+2-L)
+        enddo
+
+        !-----------------------------------------------------------------------
+        ! Compute my_CE (local physics columns) before setting grid dims
+        !-----------------------------------------------------------------------
+        my_CE = 0
+        do chnk = begchunk, endchunk
+            my_CE = my_CE + get_ncols_p(chnk)
+        enddo
+
+        !-----------------------------------------------------------------------
+        ! Create CAM physics mesh in ESMF (needed for regrid cache)
+        !-----------------------------------------------------------------------
+        call HCO_Grid_ESMF_CreateCAM(RC)
+        ASSERT_(RC==ESMF_SUCCESS)
+
+        !-----------------------------------------------------------------------
+        ! Set grid dimensions for column-based layout: NX=ncol, NY=1
+        !-----------------------------------------------------------------------
+        IM = my_CE
+        JM = 1
+        DX = 0.0_r8   ! Not meaningful for unstructured grid
+        DY = 0.0_r8
+
+        ! MPI: each PE owns its own columns, no 2D decomposition needed
+        nPET_lon = 1
+        nPET_lat = 1
+        my_IM  = my_CE
+        my_JM  = 1
+        my_IS  = 1
+        my_IE  = my_CE
+        my_JS  = 1
+        my_JE  = 1
+        my_ID  = iam
+        my_ID_I = 0
+        my_ID_J = 0
+
+        ! Create communicator (same as legacy)
+        HCO_mpicom = CAM_mpicom
+
+        !-----------------------------------------------------------------------
+        ! Allocate grid arrays in column layout (ncol, 1)
+        !-----------------------------------------------------------------------
+        allocate(XMid   (my_CE, 1  ), STAT=RC)
+        allocate(XEdge  (my_CE+1, 1), STAT=RC)
+        allocate(YMid   (my_CE, 1  ), STAT=RC)
+        allocate(YEdge  (my_CE, 2  ), STAT=RC)   ! J+1 access needs 2 entries
+        allocate(YEdge_R(my_CE, 2  ), STAT=RC)
+        allocate(YSin   (my_CE, 2  ), STAT=RC)
+        allocate(AREA_M2(my_CE, 1  ), STAT=RC)
+        ASSERT_(RC==0)
+
+        !-----------------------------------------------------------------------
+        ! Populate grid arrays from CAM physics columns
+        !-----------------------------------------------------------------------
+        dindex = 0
+        do chnk = begchunk, endchunk
+            ncols = get_ncols_p(chnk)
+            call get_rlon_all_p(chnk, ncols, lonCAM_R)
+            call get_rlat_all_p(chnk, ncols, latCAM_R)
+            call get_area_all_p(chnk, ncols, areaCAM_R)
+
+            do col = 1, ncols
+                dindex = dindex + 1
+
+                ! Column coordinates [degrees]
+                XMid(dindex, 1) = lonCAM_R(col) / PI_180
+                YMid(dindex, 1) = latCAM_R(col) / PI_180
+
+                ! Degenerate edge arrays (not used for ESMF regridding,
+                ! only MAP_A2A which is bypassed in direct mode)
+                XEdge(dindex, 1)   = XMid(dindex, 1)
+                YEdge(dindex, 1)   = YMid(dindex, 1) - 0.5_r8  ! Approximate
+                YEdge(dindex, 2)   = YMid(dindex, 1) + 0.5_r8
+                YEdge_R(dindex, 1) = YEdge(dindex, 1) * PI_180
+                YEdge_R(dindex, 2) = YEdge(dindex, 2) * PI_180
+                YSin(dindex, 1)    = sin(YEdge_R(dindex, 1))
+                YSin(dindex, 2)    = sin(YEdge_R(dindex, 2))
+
+                ! Column areas [m^2] from CAM (areaCAM is in radians^2)
+                AREA_M2(dindex, 1) = areaCAM_R(col) * Re * Re
+            enddo
+        enddo
+        ! Final XEdge entry (degenerate)
+        XEdge(my_CE+1, 1) = XEdge(my_CE, 1)
+
+        !-----------------------------------------------------------------------
+        ! Initialize regrid cache with physics mesh reference
+        !-----------------------------------------------------------------------
+        call HCO_RegridCache_Init(CAM_PhysMesh, my_CE, RC)
+        ASSERT_(RC==ESMF_SUCCESS)
+        HcoDirectMode = .true.
+
+        if (masterproc) then
+            write(iulog, '(a)') ''
+            write(iulog, '(a)') '============ HEMCO DIRECT MODE ============'
+            write(iulog, '(a,i8)') ' Physics columns (local): ', my_CE
+            write(iulog, '(a,i4)') ' Vertical levels: ', LM
+            write(iulog, '(a)')    ' Intermediate grid: BYPASSED'
+            write(iulog, '(a)') '==========================================='
+        endif
+
+        RC = ESMF_SUCCESS
+
+    end subroutine HCO_Grid_Init_Direct
+!EOC
+!------------------------------------------------------------------------------
+!                    Harmonized Emissions Component (HEMCO)                   !
+!------------------------------------------------------------------------------
+!BOP
+!
 ! !IROUTINE: HCO_Grid_UpdateRegrid
 !
 ! !DESCRIPTION: Subroutine HCO\_Grid\_UpdateRegrid initializes or updates the
@@ -788,6 +978,16 @@ contains
 
         ! Assume success
         RC = ESMF_SUCCESS
+
+        ! In direct mode, the intermediate grid ESMF infrastructure is not needed.
+        ! The CAM physics mesh and regrid cache are already initialized in
+        ! HCO_Grid_Init_Direct. Skip the four-way route handle creation.
+        if (direct_mode) then
+            if(masterproc) then
+                write(iulog,*) "HEMCO_CESM: UpdateRegrid skipped (direct mode)"
+            endif
+            return
+        endif
 
         ! Parameters for ESMF RouteHandle (taken from ionos interface)
         smm_srctermproc =  0
@@ -1560,6 +1760,17 @@ contains
 !
         character(len=*), parameter :: subname = 'HCO_Grid_HCO2CAM_3D'
         integer                     :: RC
+        integer                     :: I, K
+
+        ! Direct mode: data is already on physics grid, just reshape with vert flip
+        if (direct_mode) then
+            do I = 1, my_CE
+                do K = 1, LM
+                    camArray(K, I) = hcoArray(I, 1, LM + 1 - K)  ! Flip vertical
+                enddo
+            enddo
+            return
+        endif
 
         call HCO_ESMF_Set3DHCO(HCO_3DFld, hcoArray, my_IS, my_IE, my_JS, my_JE, 1, LM)
 
@@ -1627,8 +1838,17 @@ contains
 !
         character(len=*), parameter :: subname = 'HCO_Grid_CAM2HCO_3D'
         integer                     :: RC
+        integer                     :: I, K
 
-        integer                     :: J, K
+        ! Direct mode: data is already on physics grid, just reshape with vert flip
+        if (direct_mode) then
+            do I = 1, my_CE
+                do K = 1, LM
+                    hcoArray(I, 1, K) = camArray(LM + 1 - K, I)  ! Flip vertical
+                enddo
+            enddo
+            return
+        endif
 
         ! (field, data, KS, KE, CS, CE)
         call HCO_ESMF_Set3DCAM(CAM_3DFld, camArray, 1, LM, 1, my_CE)
@@ -1687,6 +1907,15 @@ contains
 !
         character(len=*), parameter :: subname = 'HCO_Grid_HCO2CAM_2D'
         integer                     :: RC
+        integer                     :: I
+
+        ! Direct mode: data is already on physics grid, just copy
+        if (direct_mode) then
+            do I = 1, my_CE
+                camArray(I) = hcoArray(I, 1)
+            enddo
+            return
+        endif
 
         call HCO_ESMF_Set2DHCO(HCO_2DFld, hcoArray, my_IS, my_IE, my_JS, my_JE)
 
@@ -1742,8 +1971,15 @@ contains
 !
         character(len=*), parameter :: subname = 'HCO_Grid_CAM2HCO_2D'
         integer                     :: RC
+        integer                     :: I, J
 
-        integer                     :: J
+        ! Direct mode: data is already on physics grid, just copy
+        if (direct_mode) then
+            do I = 1, my_CE
+                hcoArray(I, 1) = camArray(I)
+            enddo
+            return
+        endif
 
         ! HCO_ESMF_Set2DCAM(field, data, CS, CE)
         call HCO_ESMF_Set2DCAM(CAM_2DFld, camArray, 1, my_CE)

@@ -31,6 +31,7 @@ module hco_cam_convert_state_mod
     use hco_esmf_grid,            only: my_IM, my_JM, LM
     use hco_esmf_grid,            only: my_CE
     use hco_esmf_grid,            only: my_IS, my_IE, my_JS, my_JE
+    use hco_esmf_grid,            only: direct_mode
     use hco_esmf_grid,            only: HCO_Grid_CAM2HCO_2D, HCO_Grid_CAM2HCO_3D
     use hco_esmf_grid,            only: HCO_Grid_HCO2CAM_2D
     use ppgrid,                   only: pcols, pver ! Cols, verts

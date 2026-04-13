@@ -23,7 +23,9 @@ module hemco_interface
     use hco_esmf_wrappers,        only: HCO_ESMF_VRFY, HCO_ESMF_ASRT
 
     ! HEMCO ESMF Grid helpers and properties
-    use hco_esmf_grid,            only: HCO_Grid_Init, HCO_Grid_UpdateRegrid
+    use hco_esmf_grid,            only: HCO_Grid_Init, HCO_Grid_Init_Direct
+    use hco_esmf_grid,            only: HCO_Grid_UpdateRegrid
+    use hco_esmf_grid,            only: direct_mode
     use hco_esmf_grid,            only: HCO_Grid_HCO2CAM_2D, HCO_Grid_HCO2CAM_3D
     use hco_esmf_grid,            only: HCO_Grid_CAM2HCO_2D, HCO_Grid_CAM2HCO_3D
     use hco_esmf_grid,            only: IM, JM, LM
@@ -121,6 +123,7 @@ module hemco_interface
 
     ! HEMCO configuration parameters that are set by namelist in CESM
     integer                          :: HcoFixYY            ! if > 0, force 'Emission year'
+    logical                          :: HcoUseDirect = .false. ! Direct-to-physics-grid mode
 
     ! Meteorological fields used by HEMCO to be regridded to the HEMCO grid (hplin, 3/31/20)
     ! Fields are stored in hco_cam_convert_state_mod and regridded in HCO_GC_Run.
@@ -169,9 +172,11 @@ contains
         integer                      :: hemco_grid_xdim = 0
         integer                      :: hemco_grid_ydim = 0
         integer                      :: hemco_emission_year = -1
+        logical                      :: hemco_direct_mode = .false.
 
         namelist /hemco_nl/ hemco_data_root, hemco_config_file, hemco_diagn_file, &
-                            hemco_grid_xdim, hemco_grid_ydim, hemco_emission_year
+                            hemco_grid_xdim, hemco_grid_ydim, hemco_emission_year, &
+                            hemco_direct_mode
 
         ! Read namelist on master proc
         ! ...
@@ -191,14 +196,19 @@ contains
             write(iulog,*) "hemco_readnl: hemco data root is at = ", trim(hemco_data_root)
             write(iulog,*) "hemco_readnl: hemco config file = ", trim(hemco_config_file)
             write(iulog,*) "hemco_readnl: hemco diagn file = ", trim(hemco_diagn_file)
-            write(iulog,*) "hemco_readnl: hemco internal grid dimensions will be ", &
-                           hemco_grid_xdim, " x ", hemco_grid_ydim
 
             if(hemco_emission_year .gt. 0) then
                 write(iulog,*) "hemco_readnl: hemco will force emissions year at = ", hemco_emission_year
             else
                 write(iulog,*) "hemco_readnl: hemco will use emissions from the CESM clock"
             endif
+
+            if(hemco_direct_mode) then
+                write(iulog,*) "hemco_readnl: DIRECT MODE enabled - bypassing intermediate grid"
+            else
+                write(iulog,*) "hemco_readnl: hemco internal grid dimensions will be ", &
+                               hemco_grid_xdim, " x ", hemco_grid_ydim
+            end if
         endif
 
         ! MPI Broadcast Namelist variables
@@ -208,6 +218,7 @@ contains
         call mpi_bcast(hemco_grid_xdim, 1, mpi_integer, masterprocid, mpicom, ierr)
         call mpi_bcast(hemco_grid_ydim, 1, mpi_integer, masterprocid, mpicom, ierr)
         call mpi_bcast(hemco_emission_year, 1, mpi_integer, masterprocid, mpicom, ierr)
+        call mpi_bcast(hemco_direct_mode, 1, mpi_logical, masterprocid, mpicom, ierr)
 
         ! Save this to the module information
         HcoRoot       = hemco_data_root
@@ -216,6 +227,7 @@ contains
         HcoGridIM     = hemco_grid_xdim
         HcoGridJM     = hemco_grid_ydim
         HcoFixYY      = hemco_emission_year
+        HcoUseDirect  = hemco_direct_mode
     end subroutine hemco_readnl
 !EOC
 !------------------------------------------------------------------------------
@@ -350,33 +362,50 @@ contains
         ! 288x201 = 0.9x1.25
         ! 144x91  = 2.0x2.5
 
-        ! Verify that the grid is in a reasonable state
-        if(HcoGridIM .le. 1 .or. HcoGridJM .le. 1) then
-            call endrun("Invalid HEMCO grid parameters - too small - in &hemco namelist. Specify hemco_grid_xdim and hemco_grid_ydim as # of grid boxes in each dimension")
-        endif
-
-        if(mod(HcoGridJM, 2) .ne. 1) then
-            call endrun("Invalid HEMCO grid parameters - hemco_grid_ydim needs to be odd - in &hemco namelist. This is because y-dim has half-sized polar boxes.")
-        endif
-
-        ! Initialize the HEMCO intermediate grid
-        call HCO_Grid_Init (IM_in = HcoGridIM, JM_in = HcoGridJM, nPET_in = npes, RC=RC)
-        ASSERT_(RC==ESMF_SUCCESS)
-
-        if(masterproc) then
-            write(iulog,*) "> Initialized HEMCO Grid environment successfully!"
-            write(iulog,*) "> Global Dimensions: ", HcoGridIM, HcoGridJM, LM
-            write(iulog,*) "> my_IM, my_JM, LM, my_CE", my_IM, my_JM, LM, my_CE
-        endif
-
         !-----------------------------------------------------------------------
-        ! Update HEMCO regrid descriptors for the first time.
+        ! Branch: Direct mode (physics grid) or Legacy mode (intermediate grid)
         !-----------------------------------------------------------------------
-        call HCO_Grid_UpdateRegrid(RC=RC)
-        ASSERT_(RC==ESMF_SUCCESS)
+        if (HcoUseDirect) then
+            ! Direct mode: HcoState grid = CAM physics grid (ncol x 1).
+            ! No intermediate rectilinear grid. ESMF regridding from input
+            ! files directly to physics mesh.
+            call HCO_Grid_Init_Direct(nPET_in = npes, RC=RC)
+            ASSERT_(RC==ESMF_SUCCESS)
 
-        if(masterproc) then
-            write(iulog,*) "> First refresh of HEMCO Regrid descriptors"
+            if(masterproc) then
+                write(iulog,*) "> Initialized HEMCO Grid in DIRECT mode"
+                write(iulog,*) "> my_IM (ncol), my_JM, LM", my_IM, my_JM, LM
+            endif
+        else
+            ! Legacy mode: rectilinear intermediate grid
+            ! Verify that the grid is in a reasonable state
+            if(HcoGridIM .le. 1 .or. HcoGridJM .le. 1) then
+                call endrun("Invalid HEMCO grid parameters - too small - in &hemco namelist. Specify hemco_grid_xdim and hemco_grid_ydim as # of grid boxes in each dimension")
+            endif
+
+            if(mod(HcoGridJM, 2) .ne. 1) then
+                call endrun("Invalid HEMCO grid parameters - hemco_grid_ydim needs to be odd - in &hemco namelist. This is because y-dim has half-sized polar boxes.")
+            endif
+
+            ! Initialize the HEMCO intermediate grid
+            call HCO_Grid_Init (IM_in = HcoGridIM, JM_in = HcoGridJM, nPET_in = npes, RC=RC)
+            ASSERT_(RC==ESMF_SUCCESS)
+
+            if(masterproc) then
+                write(iulog,*) "> Initialized HEMCO Grid environment successfully!"
+                write(iulog,*) "> Global Dimensions: ", HcoGridIM, HcoGridJM, LM
+                write(iulog,*) "> my_IM, my_JM, LM, my_CE", my_IM, my_JM, LM, my_CE
+            endif
+
+            !-----------------------------------------------------------------------
+            ! Update HEMCO regrid descriptors for the first time.
+            !-----------------------------------------------------------------------
+            call HCO_Grid_UpdateRegrid(RC=RC)
+            ASSERT_(RC==ESMF_SUCCESS)
+
+            if(masterproc) then
+                write(iulog,*) "> First refresh of HEMCO Regrid descriptors"
+            endif
         endif
 
         !-----------------------------------------------------------------------
