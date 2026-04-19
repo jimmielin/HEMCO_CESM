@@ -879,9 +879,11 @@ contains
         XEdge(my_CE+1, 1) = XEdge(my_CE, 1)
 
         !-----------------------------------------------------------------------
-        ! Initialize regrid cache with physics mesh reference
+        ! Initialize regrid cache with physics mesh reference. nPET drives the
+        ! cache's source-grid decomposition decision (small grids -> single DE,
+        ! large grids -> ESMF auto-decomp) - see HCO_RegridCache_GetRH.
         !-----------------------------------------------------------------------
-        call HCO_RegridCache_Init(CAM_PhysMesh, my_CE, RC)
+        call HCO_RegridCache_Init(CAM_PhysMesh, my_CE, nPET, RC)
         ASSERT_(RC==ESMF_SUCCESS)
         HcoDirectMode = .true.
 

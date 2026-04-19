@@ -900,9 +900,15 @@ contains
         do L = 1, LM
         do J = 1, my_JM
         do I = 1, my_IM
-            ! Calculate DELP_DRY (from pressure_mod)
-            State_GC_DELP_DRY(I,J,L) = (Ap(L)   + (Bp(L)   * State_GC_PSC2_DRY(I,J))) - &
-                                       (Ap(L+1) + (Bp(L+1) * State_GC_PSC2_DRY(I,J)))
+            ! Calculate DELP_DRY (from pressure_mod).
+            ! Unit convention: Ap is stored in [Pa] (hyai*ps0, see hco_esmf_grid)
+            ! but PSC2_DRY is in [hPa] (converted at read time in CAM_GetBefore_HCOI).
+            ! The downstream AIR mass computation and surface-deposition scaling in
+            ! hemco_interface both multiply DELP_DRY by G0_100 (=100/g) which expects
+            ! hPa, so rearrange the GEOS-Chem formula to scale the Ap difference
+            ! Pa->hPa and keep the Bp*PSC2_DRY term in hPa.
+            State_GC_DELP_DRY(I,J,L) = (Ap(L) - Ap(L+1)) * 0.01_r8 + &
+                                       (Bp(L) - Bp(L+1)) * State_GC_PSC2_DRY(I,J)
 
             ! Calculate AD (AIR mass)
             ! Note that AREA_M2 are GLOBAL indices so you need to perform offsetting!!
@@ -1056,7 +1062,13 @@ contains
                 ! PBL thickness [hPa]
                 BLTHIK = HcoState%Grid%PEDGE%Val(I,J,1) - BLTOP
 
-                ! Now, find the PBL top level
+                ! Now, find the PBL top level. Default to LM (model top) if
+                ! BLTOP is at or below the model lid - otherwise LTOP retains
+                ! the previous (I,J) column's value, which leaks into the
+                ! F_OF_PBL fractions computed below. This matters for small
+                ! distributed grids where individual columns can fall outside
+                ! the BLTOP search range.
+                LTOP = LM
                 do L = 1, LM
                     if(BLTOP > HcoState%Grid%PEDGE%Val(I,J,L+1)) then
                         LTOP = L
