@@ -2,6 +2,10 @@
 
 This file documents all notable changes to the HEMCO-CESM interface since late 2022.
 
+## [2.3.1] - 2026-04-21
+### Changed
+- Updated HEMCO submodule from 3.10.3 to 3.12.1 (see HEMCO changelog for details)
+
 ## [2.3.0] - 2026-04-12
 ### Changed
 - No longer has standalone ESMF GridComp since CESM has fully adopted the NUOPC coupler
