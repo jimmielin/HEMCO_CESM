@@ -749,7 +749,7 @@ contains
         use ppgrid,             only: pcols
 
         use ESMF,               only: ESMF_MeshGet, ESMF_KIND_R8
-        use hco_esmf_regrid_cache, only: HCO_RegridCache_Init, HcoDirectMode
+        use hco_esmf_regrid_cache, only: HCO_RegridCache_Init
 !
 ! !INPUT PARAMETERS:
 !
@@ -880,12 +880,14 @@ contains
 
         !-----------------------------------------------------------------------
         ! Initialize regrid cache with physics mesh reference. nPET drives the
-        ! cache's source-grid decomposition decision (small grids -> single DE,
-        ! large grids -> ESMF auto-decomp) - see HCO_RegridCache_GetRH.
+        ! cache's source-grid decomposition search - see HCO_RegridCache_GetRH.
+        ! This also registers the ESMF regridder with HEMCO's direct-regrid
+        ! hook (hco_directregrid_mod), which enables HcoDirectMode on the
+        ! HEMCO side and hands it the communicator for collective
+        ! point-source lookup.
         !-----------------------------------------------------------------------
-        call HCO_RegridCache_Init(CAM_PhysMesh, my_CE, nPET, RC)
+        call HCO_RegridCache_Init(CAM_PhysMesh, my_CE, nPET, HCO_mpicom, RC)
         ASSERT_(RC==ESMF_SUCCESS)
-        HcoDirectMode = .true.
 
         if (masterproc) then
             write(iulog, '(a)') ''

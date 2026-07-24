@@ -52,11 +52,12 @@ contains
 !  fractional overlap with source layers in sigma space and redistributes
 !  the data proportionally.
 !
-!  This routine conserves the column-integrated quantity when the input data
-!  represents layer-mean intensive quantities (e.g., mixing ratios, kg/m2/s
-!  per layer). The conservation property comes from the overlap-weighting:
-!  each target layer value is the overlap-weighted average of contributing
-!  source layers.
+!  This routine conserves the column-integrated quantity (in the
+!  sum(data*dsigma) sense) when the input data represents layer-mean
+!  intensive quantities (e.g., mixing ratios, kg/m2/s per layer). The
+!  conservation property comes from the overlap-weighting: each target
+!  layer value is the overlap-weighted average of contributing source
+!  layers.
 !\\
 !\\
 ! !INTERFACE:
@@ -81,8 +82,8 @@ contains
 !  (index nlev+1, sigma~0.0), consistent with HEMCO convention where
 !  level 1 is the surface.
 !
-!  For source layers that extend beyond the target grid range,
-!  extrapolation uses the boundary source layer value (no data is lost).
+!  Source mass outside the target sigma span is dropped; in practice both
+!  spans cover [~1, ~0] so the effect is negligible.
 !
 ! !REVISION HISTORY:
 !  09 Apr 2026 - H.P. Lin    - Initial version

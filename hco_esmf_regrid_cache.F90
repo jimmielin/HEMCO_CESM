@@ -22,9 +22,11 @@
 !  repeated ESMF_FieldRegridStore calls. Typical HEMCO configurations use
 !  5-10 unique input grids, so the cache is small.
 !
-!  This module also provides the HCO\_ESMF\_REGRID\_DIRECT subroutine, which
-!  is called from hcoio\_read\_pio\_mod.F90 in place of MAP_A2A/MESSy when
-!  direct mode is enabled.
+!  The hook contract is owned by HEMCO (hco\_directregrid\_mod.F90):
+!  HCO\_RegridCache\_Init registers HCO\_ESMF\_REGRID\_DIRECT with
+!  HCO\_DirectRegrid\_Register, and HEMCO's hcoio\_read\_pio\_mod.F90
+!  dispatches to it through HCO\_DirectRegrid\_Run whenever HcoDirectMode
+!  is enabled.
 !\\
 !\\
 ! !INTERFACE:
@@ -35,7 +37,7 @@ module hco_esmf_regrid_cache
 !
     use hco_esmf_wrappers
     use ESMF,            only: ESMF_Mesh, ESMF_Grid, ESMF_Field, ESMF_RouteHandle
-    use ESMF,            only: ESMF_SUCCESS
+    use ESMF,            only: ESMF_SUCCESS, ESMF_FAILURE
     use shr_kind_mod,    only: r8 => shr_kind_r8
     use HCO_Types_Mod,   only: ListCont, hp, sp, dp
     use HCO_State_Mod,   only: HCO_State
@@ -50,12 +52,6 @@ module hco_esmf_regrid_cache
     public :: HCO_RegridCache_Cleanup
     public :: HCO_ESMF_REGRID_DIRECT
 !
-! !PUBLIC DATA:
-!
-    ! Flag indicating whether direct mode is active.
-    ! Set by HEMCO_CESM during initialization, read by hcoio_read_pio_mod.
-    logical, public     :: HcoDirectMode = .false.
-!
 ! !REVISION HISTORY:
 !  09 Apr 2026 - H.P. Lin    - Initial version for direct-mode regridding
 !EOP
@@ -66,11 +62,17 @@ module hco_esmf_regrid_cache
 !
     integer, parameter :: MAX_CACHED_GRIDS = 20
 
+    ! Tolerance [deg] for matching input grid edges against a cached entry.
+    real(r8), parameter :: EDGE_TOL = 1.0e-6_r8
+
     type :: RegridCacheEntry
         integer  :: nlon = 0            ! Input grid # longitudes
         integer  :: nlat = 0            ! Input grid # latitudes
-        real(r8) :: lon0 = -999.0_r8    ! First longitude edge (for uniqueness)
-        real(r8) :: lat0 = -999.0_r8    ! First latitude edge (for uniqueness)
+        ! Full edge arrays are the uniqueness key. Dims + first edge alone
+        ! would collide for same-size, same-origin grids with different
+        ! spacing (e.g. non-uniform latitude grids, half-polar variants).
+        real(r8), allocatable :: lonEdges(:)   ! (nlon+1) [deg]
+        real(r8), allocatable :: latEdges(:)   ! (nlat+1) [deg]
         type(ESMF_Grid)        :: srcGrid
         type(ESMF_Field)       :: srcField2D
         type(ESMF_Field)       :: dstField2D
@@ -85,11 +87,8 @@ module hco_esmf_regrid_cache
     type(ESMF_Mesh)     :: phys_mesh
     integer             :: phys_ncol = 0    ! Local # physics columns
 
-    ! Number of PETs in the HEMCO communicator. Cached at init time so
-    ! the source-grid decomposition in HCO_RegridCache_GetRH can decide
-    ! between auto-decomposition (large source grids) and forced single-DE
-    ! layout (small source grids like gc_layers.nc, which ESMF rejects
-    ! under auto-decomp because it produces width-1 DEs).
+    ! Number of PETs in the HEMCO communicator. Cached at init time to
+    ! drive the source-grid decomposition search in HCO_RegridCache_GetRH.
     integer             :: cached_nPET = 1
 
 contains
@@ -100,18 +99,25 @@ contains
 ! !IROUTINE: HCO_RegridCache_Init
 !
 ! !DESCRIPTION: Initializes the regrid cache with a reference to the CAM
-!  physics mesh. Must be called after HCO_Grid_ESMF_CreateCAM.
+!  physics mesh, and registers this module's regridder with HEMCO's
+!  direct-regrid hook (which enables HcoDirectMode on the HEMCO side).
+!  Must be called after HCO_Grid_ESMF_CreateCAM.
 !\\
 !\\
 ! !INTERFACE:
 !
-    subroutine HCO_RegridCache_Init( mesh, ncol, nPET, RC )
+    subroutine HCO_RegridCache_Init( mesh, ncol, nPET, mpicom, RC )
+!
+! !USES:
+!
+        use HCO_DirectRegrid_Mod, only: HCO_DirectRegrid_Register
 !
 ! !INPUT PARAMETERS:
 !
         type(ESMF_Mesh), intent(in) :: mesh
-        integer,         intent(in) :: ncol  ! Local # physics columns
-        integer,         intent(in) :: nPET  ! # PETs in HEMCO communicator
+        integer,         intent(in) :: ncol   ! Local # physics columns
+        integer,         intent(in) :: nPET   ! # PETs in HEMCO communicator
+        integer,         intent(in) :: mpicom ! HEMCO MPI communicator
 !
 ! !OUTPUT PARAMETERS:
 !
@@ -130,6 +136,10 @@ contains
         nCached     = 0
         RC          = ESMF_SUCCESS
 
+        ! Enable HcoDirectMode and hand HEMCO the regridding entry point plus
+        ! the communicator (used by HEMCO for collective point-source lookup).
+        call HCO_DirectRegrid_Register(HCO_ESMF_REGRID_DIRECT, mpiComm=mpicom)
+
     end subroutine HCO_RegridCache_Init
 !EOC
 !------------------------------------------------------------------------------
@@ -146,7 +156,7 @@ contains
 ! !INTERFACE:
 !
     subroutine HCO_RegridCache_GetRH( nlon, nlat, LonEdge, LatEdge, &
-                                      idx, RC )
+                                      idx, RC, msg_out )
 !
 ! !USES:
 !
@@ -175,6 +185,7 @@ contains
 !
         integer,  intent(out) :: idx               ! Cache index for this grid
         integer,  intent(out) :: RC
+        character(len=*), optional, intent(out) :: msg_out
 !
 ! !REVISION HISTORY:
 !  09 Apr 2026 - H.P. Lin    - Initial version
@@ -185,12 +196,10 @@ contains
         integer  :: n, i, j
         integer  :: srcLocalDECount
         integer  :: lbnd(2), ubnd(2)
-        logical  :: can_parallel_decomp
+        integer  :: decompNx, decompNy
         real(ESMF_KIND_R8), pointer :: coordX(:,:), coordY(:,:)
         real(ESMF_KIND_R8), pointer :: coordX_E(:,:), coordY_E(:,:)
         type(ESMF_ArraySpec) :: arrayspec
-        real(r8) :: lon0_in, lat0_in
-        real(r8) :: dx, dy
         ! ESMF_FieldRegridStore dummies for srcTermProcessing / pipelineDepth
         ! are intent(inout) - cannot pass literal constants.
         integer  :: srcTermProc_arg
@@ -198,20 +207,16 @@ contains
 
         RC = ESMF_SUCCESS
 
-        ! Composite key for cache lookup
-        lon0_in = real(LonEdge(1), r8)
-        lat0_in = real(LatEdge(1), r8)
-
-        ! Check cache for existing entry
+        ! Check cache for an existing entry: dims plus the full edge arrays
+        ! must match.
         do n = 1, nCached
-            if (cache(n)%initialized .and. &
-                cache(n)%nlon == nlon .and. cache(n)%nlat == nlat .and. &
-                abs(cache(n)%lon0 - lon0_in) < 1.0e-6_r8 .and. &
-                abs(cache(n)%lat0 - lat0_in) < 1.0e-6_r8) then
-                ! Cache hit
-                idx = n
-                return
-            endif
+            if (.not. cache(n)%initialized) cycle
+            if (cache(n)%nlon /= nlon .or. cache(n)%nlat /= nlat) cycle
+            if (maxval(abs(cache(n)%lonEdges - real(LonEdge, r8))) > EDGE_TOL) cycle
+            if (maxval(abs(cache(n)%latEdges - real(LatEdge, r8))) > EDGE_TOL) cycle
+            ! Cache hit
+            idx = n
+            return
         enddo
 
         ! Cache miss — create new entry
@@ -237,8 +242,11 @@ contains
 
         cache(idx)%nlon = nlon
         cache(idx)%nlat = nlat
-        cache(idx)%lon0 = lon0_in
-        cache(idx)%lat0 = lat0_in
+        if (allocated(cache(idx)%lonEdges)) deallocate(cache(idx)%lonEdges)
+        if (allocated(cache(idx)%latEdges)) deallocate(cache(idx)%latEdges)
+        allocate(cache(idx)%lonEdges(nlon+1), cache(idx)%latEdges(nlat+1))
+        cache(idx)%lonEdges(:) = real(LonEdge, r8)
+        cache(idx)%latEdges(:) = real(LatEdge, r8)
 
         if (masterproc) then
             write(iulog,*) "HEMCO RegridCache: Creating route handle for input grid ", &
@@ -250,46 +258,57 @@ contains
         ! full input grid via PIO; ESMF handles the regrid-weight computation
         ! across PETs internally via FieldRegridStore.
         !
-        ! Decomposition choice: small grids (e.g. gc_layers.nc 4x4) must live
-        ! on a single DE, because ESMF auto-decomposition would produce width-1
-        ! DEs that both CONSERVE and BILINEAR regridding reject. Large grids
-        ! (e.g. 3599x1799) benefit dramatically from parallel weight compute,
-        ! so we allow auto-decomposition when every tile is guaranteed at
-        ! least 2 cells per dim under the worst-case square layout:
-        !    min(nlon,nlat)**2 >= 4*nPET
-        !   (i.e. min(nlon,nlat) / sqrt(nPET) >= 2).
+        ! Choose an explicit source-grid decomposition: decompNx*decompNy DEs
+        ! with every DE at least 2 cells wide in both dims (ESMF conservative
+        ! regridding rejects width<2 DEs). This mirrors the intermediate-grid
+        ! decomposition search in hco_esmf_grid (and the WACCM-X ionosphere
+        ! interface it derives from), rather than relying on ESMF's default
+        ! regDecomp of (petCount, 1), which produces zero-width DEs whenever
+        ! nlon < petCount.
+        !
+        ! Large grids benefit dramatically from parallel weight computation -
+        ! a single-DE decomp forces all O(M*N*P) work onto one PET, serializing
+        ! ESMF_FieldRegridStore setup. PIO reads the source array in full on
+        ! every PE, so no data redistribution is needed before the src fill -
+        ! see the srcLocalDECount gating in HCO_ESMF_REGRID_DIRECT.
         !-----------------------------------------------------------------------
-
-        ! Compute grid center coordinates from edges
-        dx = real(LonEdge(2) - LonEdge(1), r8)
-        dy = real(LatEdge(2) - LatEdge(1), r8)
-
-        can_parallel_decomp = (min(nlon, nlat)**2 >= 4*cached_nPET)
-
-        if (can_parallel_decomp) then
-            cache(idx)%srcGrid = ESMF_GridCreate1PeriDim(        &
-                maxIndex=(/nlon, nlat/),                          &
-                indexflag=ESMF_INDEX_GLOBAL,                      &
-                rc=RC)
-        else
-            cache(idx)%srcGrid = ESMF_GridCreate1PeriDim(        &
-                maxIndex=(/nlon, nlat/),                          &
-                regDecomp=(/1, 1/),                               &
-                indexflag=ESMF_INDEX_GLOBAL,                      &
-                rc=RC)
+        decompNx = 0
+        decompNy = 0
+        do i = 2, min(nlon, cached_nPET)
+            if (mod(cached_nPET, i) /= 0) cycle
+            j = cached_nPET / i
+            if (j > nlat) cycle
+            if (nlon/i > 1 .and. nlat/j > 1) then
+                decompNx = i
+                decompNy = j
+                exit
+            endif
+        enddo
+        ! Fall back to a 1-D latitude decomposition, then to a single DE
+        ! (small grids and prime PET counts land here; non-source-owning PETs
+        ! are handled downstream via the srcLocalDECount guards).
+        if (decompNx == 0) then
+            if (cached_nPET <= nlat/2) then
+                decompNx = 1
+                decompNy = cached_nPET
+            else
+                decompNx = 1
+                decompNy = 1
+            endif
         endif
+
+        cache(idx)%srcGrid = ESMF_GridCreate1PeriDim(        &
+            maxIndex=(/nlon, nlat/),                          &
+            regDecomp=(/decompNx, decompNy/),                 &
+            indexflag=ESMF_INDEX_GLOBAL,                      &
+            rc=RC)
         ASSERT_(RC==ESMF_SUCCESS)
 
         if (masterproc) then
-            if (can_parallel_decomp) then
-                write(iulog,'(a,i0,a,i0,a,i0,a)') &
-                    "HEMCO RegridCache: ", nlon, "x", nlat, &
-                    " - ESMF auto-decomposition across ", cached_nPET, " PETs"
-            else
-                write(iulog,'(a,i0,a,i0,a,i0,a)') &
-                    "HEMCO RegridCache: ", nlon, "x", nlat, &
-                    " - forced single-DE (grid too small for ", cached_nPET, " PETs)"
-            endif
+            write(iulog,'(a,i0,a,i0,a,i0,a,i0,a,i0,a)') &
+                "HEMCO RegridCache: ", nlon, "x", nlat, &
+                " - decomposed into ", decompNx, "x", decompNy, &
+                " DEs across ", cached_nPET, " PETs"
         endif
 
         ! Add center and corner coordinates (collective - all PETs call)
@@ -301,10 +320,10 @@ contains
                                staggerloc=ESMF_STAGGERLOC_CORNER, rc=RC)
         ASSERT_(RC==ESMF_SUCCESS)
 
-        ! With regDecomp=(/1,1/), only one PET (typically PET 0) holds a
-        ! local DE for the source grid. Non-root PETs have localDECount == 0
-        ! and cannot call ESMF_GridGetCoord(localDE=0). Skip the coord fill
-        ! on those PETs - they still participate collectively in
+        ! With a single-DE decomp, only one PET holds a local DE for the
+        ! source grid. Non-owning PETs have localDECount == 0 and cannot
+        ! call ESMF_GridGetCoord(localDE=0). Skip the coord fill on those
+        ! PETs - they still participate collectively in
         ! ESMF_FieldCreate / ESMF_FieldRegridStore below.
         call ESMF_GridGet(cache(idx)%srcGrid, localDECount=srcLocalDECount, rc=RC)
         ASSERT_(RC==ESMF_SUCCESS)
@@ -373,14 +392,17 @@ contains
         ASSERT_(RC==ESMF_SUCCESS)
 
         !-----------------------------------------------------------------------
-        ! Create route handle. Preferred method is CONSERVE (correct for
+        ! Create route handle with the CONSERVE method (correct for
         ! area-weighted flux regridding). CONSERVE computes cell areas from
-        ! the corner coordinates and rejects degenerate configurations
-        ! (very coarse source grids like gc_layers.nc with 4x4 lat/lon
-        ! near-pole corner cells). When CONSERVE fails we fall back to
-        ! BILINEAR, which only requires cell centers. BILINEAR is
-        ! non-conservative but acceptable for scale-factor inputs where
-        ! the horizontal field is effectively constant.
+        ! the corner coordinates and rejects degenerate configurations, e.g.
+        ! very coarse index-like source grids (gc_layers.nc, 4x4) whose
+        ! near-pole corner cells collapse. For those grids ONLY, fall back
+        ! to BILINEAR: they carry index/scale-factor style data where the
+        ! horizontal field is effectively constant, so non-conservative
+        ! interpolation is acceptable. For any grid large enough to carry
+        ! real flux data, a CONSERVE failure is a hard error - silently
+        ! degrading base emissions to a non-conservative method would defeat
+        ! the purpose of the direct regridding path.
         !
         ! srcTermProcessing / pipelineDepth are intent(inout) - pass via
         ! local scalars rather than literal constants.
@@ -397,6 +419,20 @@ contains
             pipelineDepth=pipelineDepth_arg, rc=RC)
 
         if (RC /= ESMF_SUCCESS) then
+            if (min(nlon, nlat) > 4) then
+                if (masterproc) then
+                    write(iulog,'(a,i0,a,i0,a)') &
+                        "HEMCO RegridCache: ERROR - conservative regrid weight "// &
+                        "generation failed for ", nlon, "x", nlat, " source grid."
+                endif
+                if (present(msg_out)) then
+                    msg_out = subname//': ESMF_FieldRegridStore (CONSERVE) failed'// &
+                              ' for a non-degenerate source grid; refusing to fall'// &
+                              ' back to non-conservative regridding for flux data.'
+                endif
+                return
+            endif
+
             if (masterproc) then
                 write(iulog,'(a,i0,a,i0,a)') &
                     "HEMCO RegridCache: WARNING - CONSERVE regrid failed for ", &
@@ -433,21 +469,25 @@ contains
 !
 ! !IROUTINE: HCO_ESMF_REGRID_DIRECT
 !
-! !DESCRIPTION: Main entry point for direct ESMF regridding. Called from
-!  hcoio\_read\_pio\_mod.F90 in place of REGRID\_MAPA2A and HCO\_MESSY\_REGRID
-!  when direct mode is enabled.
+! !DESCRIPTION: Main entry point for direct ESMF regridding. Registered with
+!  HEMCO's hco\_directregrid\_mod hook at init time and dispatched from
+!  hcoio\_read\_pio\_mod.F90 in place of REGRID\_MAPA2A and HCO\_MESSY\_REGRID.
 !
 !  For 2D data: performs ESMF conservative horizontal regridding directly
 !  from the input file grid to physics columns.
 !
 !  For 3D data: performs ESMF horizontal regridding per-level, then
-!  sigma-to-sigma conservative vertical interpolation per-column.
+!  sigma-to-sigma conservative vertical interpolation per-column. Source
+!  sigma edges (SigEdge, prepared by the HEMCO reader) are themselves
+!  horizontally regridded onto the columns when they vary across the input
+!  domain, so terrain-following inputs keep their column-local vertical
+!  placement.
 !\\
 !\\
 ! !INTERFACE:
 !
     subroutine HCO_ESMF_REGRID_DIRECT( HcoState, NcArr, LonEdge, LatEdge, &
-                                       SigEdge, Lct, IsModelLevel, RC )
+                                       SigEdge, Lct, RC, msg_out )
 !
 ! !USES:
 !
@@ -471,12 +511,15 @@ contains
         real(hp),        pointer       :: LonEdge(:)       ! Input lon edges
         real(hp),        pointer       :: LatEdge(:)       ! Input lat edges
         real(hp),        pointer       :: SigEdge(:,:,:)   ! Input sigma edges (may be NULL)
-        logical,         intent(in)    :: IsModelLevel      ! Data on GEOS-Chem levels?
 !
 ! !INPUT/OUTPUT PARAMETERS:
 !
         type(ListCont),  pointer       :: Lct
         integer,         intent(inout) :: RC
+!
+! !OUTPUT PARAMETERS:
+!
+        character(len=*), optional, intent(out) :: msg_out
 !
 ! !REVISION HISTORY:
 !  09 Apr 2026 - H.P. Lin    - Initial version
@@ -491,6 +534,7 @@ contains
         integer :: L, T, I, J, esmf_rc
         integer :: srcLocalDECount
         integer :: srcLo(2), srcHi(2)     ! srcPtr local computational bounds
+        logical :: sig_uniform
 
         ! Threshold for NetCDF _FillValue detection at srcPtr fill time.
         ! Realistic emission fluxes peak O(1) kg/m^2/s and scale factors are
@@ -503,6 +547,10 @@ contains
         ! slips past equality-based masking.
         real(r8), parameter :: FILL_THRESHOLD = 1.0e15_r8
 
+        ! Tolerance for detecting horizontally-uniform source sigma edges
+        ! (sigma is dimensionless, O(1e-5..1)).
+        real(hp), parameter :: SIG_UNIFORM_TOL = 1.0e-10_hp
+
         ! ESMF field data pointers
         real(ESMF_KIND_R8), pointer :: srcPtr(:,:)   ! Source field data
         real(ESMF_KIND_R8), pointer :: dstPtr(:)     ! Destination field data
@@ -511,25 +559,8 @@ contains
         real(r8), allocatable :: hRegridded(:,:)     ! (ncol, nlev) after horiz regrid
         real(r8), allocatable :: data_tgt(:,:)       ! (ncol, NZ) after vert regrid
         real(r8), allocatable :: sig_tgt(:,:)        ! (ncol, NZ+1) target sigma edges
-        real(r8), allocatable :: sig_src_1d(:)       ! Source sigma edges (1D, uniform)
-
-        ! Hardcoded GEOS-Chem 72-level sigma edges (same as in hcoio_read_pio_mod.F90).
-        ! Declared parameter so the compiler treats this as a true constant and
-        ! does not allocate per-call storage with implicit SAVE.
-        real(hp), parameter :: GC_72_EDGE_SIGMA(73) = (/ &
-          1.000000E+00, 9.849998E-01, 9.699136E-01, 9.548285E-01, 9.397434E-01, 9.246593E-01, &
-          9.095741E-01, 8.944900E-01, 8.794069E-01, 8.643237E-01, 8.492406E-01, 8.341584E-01, &
-          8.190762E-01, 7.989697E-01, 7.738347E-01, 7.487007E-01, 7.235727E-01, 6.984446E-01, &
-          6.733175E-01, 6.356319E-01, 5.979571E-01, 5.602823E-01, 5.226252E-01, 4.849751E-01, &
-          4.473417E-01, 4.097261E-01, 3.721392E-01, 3.345719E-01, 2.851488E-01, 2.420390E-01, &
-          2.055208E-01, 1.746163E-01, 1.484264E-01, 1.261653E-01, 1.072420E-01, 9.115815E-02, &
-          7.748532E-02, 6.573205E-02, 5.565063E-02, 4.702097E-02, 3.964964E-02, 3.336788E-02, &
-          2.799704E-02, 2.341969E-02, 1.953319E-02, 1.624180E-02, 1.346459E-02, 1.112953E-02, &
-          9.171478E-03, 7.520355E-03, 6.135702E-03, 4.981002E-03, 4.023686E-03, 3.233161E-03, &
-          2.585739E-03, 2.057735E-03, 1.629410E-03, 1.283987E-03, 1.005675E-03, 7.846040E-04, &
-          6.089317E-04, 4.697755E-04, 3.602270E-04, 2.753516E-04, 2.082408E-04, 1.569208E-04, &
-          1.184308E-04, 8.783617E-05, 6.513694E-05, 4.737232E-05, 3.256847E-05, 1.973847E-05, &
-          9.869233E-06/)
+        real(r8), allocatable :: sig_src_1d(:)       ! (nlev+1) uniform source sigma
+        real(r8), allocatable :: sig_src_col(:,:)    ! (ncol, nlev+1) per-column source sigma
 
         ! Get input array dimensions
         nlon  = size(NcArr, 1)
@@ -539,15 +570,20 @@ contains
         NX    = HcoState%NX       ! = ncol (physics columns)
         NZ    = HcoState%NZ       ! = CAM vertical levels
 
-        ! Get/create cached route handle for this input grid
-        call HCO_RegridCache_GetRH(nlon, nlat, LonEdge, LatEdge, cache_idx, esmf_rc)
-        ASSERT_(esmf_rc==ESMF_SUCCESS)
+        ! Get/create cached route handle for this input grid. Propagate
+        ! failures (e.g. the refused CONSERVE->BILINEAR fallback) via
+        ! RC/msg_out so HEMCO's dispatch can report them.
+        call HCO_RegridCache_GetRH(nlon, nlat, LonEdge, LatEdge, cache_idx, &
+                                   esmf_rc, msg_out)
+        if (esmf_rc /= ESMF_SUCCESS) then
+            RC = ESMF_FAILURE
+            return
+        endif
 
-        ! With regDecomp=(/1,1/) on the source grid (small-grid path), only one
-        ! PET holds the source-side DE. Guard src-side FieldGet so non-root
-        ! PETs don't trip "localDeCount <= 0" errors. ESMF_FieldRegrid is
-        ! collective and handles src->dst PET communication internally, so
-        ! all PETs must still call it.
+        ! Only PETs owning a source-side DE may touch srcPtr. Guard src-side
+        ! FieldGet so non-owning PETs don't trip "localDeCount <= 0" errors.
+        ! ESMF_FieldRegrid is collective and handles src->dst PET
+        ! communication internally, so all PETs must still call it.
         call ESMF_GridGet(cache(cache_idx)%srcGrid, localDECount=srcLocalDECount, &
                           rc=esmf_rc)
         ASSERT_(esmf_rc==ESMF_SUCCESS)
@@ -561,7 +597,7 @@ contains
             ! bounds, so srcPtr(J,I) with J,I in [srcLo..srcHi] addresses
             ! the correct slice of NcArr (every PE has NcArr in full from
             ! PIO). For single-DE decomp srcLo/srcHi span the whole grid;
-            ! for auto-decomp they span this PET's tile.
+            ! for a parallel decomp they span this PET's tile.
             srcLo = lbound(srcPtr)
             srcHi = ubound(srcPtr)
         endif
@@ -633,24 +669,85 @@ contains
             ! Allocate intermediate arrays
             allocate(hRegridded(NX, nlev))
 
-            ! For 3D with vertical regridding, allocate target arrays once
+            ! For 3D data with a vertical dimension, source sigma edges must
+            ! have been prepared by the HEMCO reader (model-level table or file
+            ! coordinates); the target sigma comes from the HEMCO vertical grid.
             if (nlev > 1) then
+                if (.not. associated(SigEdge)) then
+                    RC = ESMF_FAILURE
+                    if (present(msg_out)) then
+                        msg_out = subname//': multi-level 3D input requires source'// &
+                                  ' sigma edges (SigEdge) but none were provided by'// &
+                                  ' the HEMCO reader.'
+                    endif
+                    deallocate(hRegridded)
+                    return
+                endif
+                if (.not. associated(HcoState%Grid%PEDGE%Val)) then
+                    RC = ESMF_FAILURE
+                    if (present(msg_out)) then
+                        msg_out = subname//': HcoState%Grid%PEDGE is not set - the'// &
+                                  ' HEMCO vertical grid must be established (via'// &
+                                  ' HCO_CalcVertGrid) before 3D data is read.'
+                    endif
+                    deallocate(hRegridded)
+                    return
+                endif
+
                 allocate(data_tgt(NX, NZ))
                 allocate(sig_tgt(NX, NZ+1))
 
-                ! Compute target sigma edges from HcoState pressure edges
+                ! Compute target sigma edges from HcoState pressure edges:
                 ! sigma = PEDGE / PSFC where PSFC = PEDGE(:,:,1)
                 do I = 1, NX
                     do L = 1, NZ+1
-                        if (associated(HcoState%Grid%PEDGE%Val)) then
-                            sig_tgt(I, L) = HcoState%Grid%PEDGE%Val(I, 1, L) &
-                                          / HcoState%Grid%PEDGE%Val(I, 1, 1)
-                        else
-                            ! Fallback: uniform sigma spacing (should not happen)
-                            sig_tgt(I, L) = 1.0_r8 - real(L-1, r8) / real(NZ, r8)
-                        endif
+                        sig_tgt(I, L) = HcoState%Grid%PEDGE%Val(I, 1, L) &
+                                      / HcoState%Grid%PEDGE%Val(I, 1, 1)
                     enddo
                 enddo
+
+                ! Source sigma edges on the physics columns. Most inputs carry
+                ! horizontally-uniform sigma (all GEOS-Chem model-level data,
+                ! and most pressure-level files); detect that case and use a
+                ! single shared profile. Otherwise (terrain-following
+                ! coordinates), horizontally regrid each sigma edge level onto
+                ! the columns so the vertical interpolation stays column-local.
+                sig_uniform = .true.
+                do L = 1, nlev + 1
+                    if (maxval(SigEdge(:,:,L)) - minval(SigEdge(:,:,L)) > SIG_UNIFORM_TOL) then
+                        sig_uniform = .false.
+                        exit
+                    endif
+                enddo
+
+                if (sig_uniform) then
+                    allocate(sig_src_1d(nlev + 1))
+                    do L = 1, nlev + 1
+                        sig_src_1d(L) = real(SigEdge(1, 1, L), r8)
+                    enddo
+                else
+                    allocate(sig_src_col(NX, nlev + 1))
+                    do L = 1, nlev + 1
+                        if (srcLocalDECount > 0) then
+                            do I = srcLo(2), srcHi(2)
+                                do J = srcLo(1), srcHi(1)
+                                    srcPtr(J, I) = real(SigEdge(J, I, L), r8)
+                                enddo
+                            enddo
+                        endif
+
+                        dstPtr(:) = 0.0_r8
+
+                        call ESMF_FieldRegrid(cache(cache_idx)%srcField2D,  &
+                                              cache(cache_idx)%dstField2D,  &
+                                              cache(cache_idx)%rh2D,        &
+                                              termorderflag=ESMF_TERMORDER_SRCSEQ, &
+                                              rc=esmf_rc)
+                        ASSERT_(esmf_rc==ESMF_SUCCESS)
+
+                        sig_src_col(:, L) = dstPtr(1:NX)
+                    enddo
+                endif
             endif
 
             do T = 1, ntime
@@ -689,46 +786,16 @@ contains
                 ! Step 2: Vertical regrid per-column from input levels to CAM levels
                 if (nlev > 1) then
 
-                    ! Determine source sigma edges and perform vertical regrid
-                    if (IsModelLevel) then
-                        ! GEOS-Chem level data: use hardcoded sigma edges
-                        allocate(sig_src_1d(nlev + 1))
-                        sig_src_1d(1:nlev+1) = real(GC_72_EDGE_SIGMA(1:nlev+1), r8)
-
+                    if (sig_uniform) then
                         call HCO_VertRegrid_3D(NX, nlev, NZ,       &
                                                hRegridded, data_tgt, &
                                                sig_tgt,              &
                                                sig_src_1d=sig_src_1d)
-                        deallocate(sig_src_1d)
-
-                    else if (associated(SigEdge)) then
-                        ! Real-coordinate data: sigma from file
-                        ! SigEdge is (nlon, nlat, nlev+1) on the input grid.
-                        ! After horizontal regridding, use a representative profile.
-                        ! Average the sigma edges across the input horizontal domain
-                        ! (sigma is typically uniform across the domain for most datasets).
-                        allocate(sig_src_1d(nlev + 1))
-                        do L = 1, nlev + 1
-                            sig_src_1d(L) = 0.0_r8
-                            do I = 1, min(size(SigEdge, 1), nlon)
-                                sig_src_1d(L) = sig_src_1d(L) + &
-                                    real(SigEdge(I, 1, L), r8)
-                            enddo
-                            sig_src_1d(L) = sig_src_1d(L) / real(min(size(SigEdge, 1), nlon), r8)
-                        enddo
-
-                        call HCO_VertRegrid_3D(NX, nlev, NZ,       &
-                                               hRegridded, data_tgt, &
-                                               sig_tgt,              &
-                                               sig_src_1d=sig_src_1d)
-                        deallocate(sig_src_1d)
                     else
-                        ! No sigma info — assume input levels map to model levels
-                        ! (direct copy for as many levels as available)
-                        data_tgt = 0.0_r8
-                        do L = 1, min(nlev, NZ)
-                            data_tgt(:, L) = hRegridded(:, L)
-                        enddo
+                        call HCO_VertRegrid_3D(NX, nlev, NZ,       &
+                                               hRegridded, data_tgt, &
+                                               sig_tgt,              &
+                                               sig_src_3d=sig_src_col)
                     endif
 
                     ! Store in HEMCO data container (ncol, 1, NZ)
@@ -748,10 +815,10 @@ contains
             enddo ! T
 
             ! Cleanup
-            if (nlev > 1) then
-                deallocate(data_tgt)
-                deallocate(sig_tgt)
-            endif
+            if (allocated(sig_src_1d))  deallocate(sig_src_1d)
+            if (allocated(sig_src_col)) deallocate(sig_src_col)
+            if (allocated(data_tgt))    deallocate(data_tgt)
+            if (allocated(sig_tgt))     deallocate(sig_tgt)
             deallocate(hRegridded)
 
         endif ! SpaceDim
@@ -765,7 +832,8 @@ contains
 !
 ! !IROUTINE: HCO_RegridCache_Cleanup
 !
-! !DESCRIPTION: Destroys all cached ESMF objects to free memory.
+! !DESCRIPTION: Destroys all cached ESMF objects to free memory, and
+!  deregisters the direct-regrid hook from HEMCO.
 !\\
 !\\
 ! !INTERFACE:
@@ -775,6 +843,7 @@ contains
 ! !USES:
 !
         use ESMF, only: ESMF_FieldDestroy, ESMF_GridDestroy, ESMF_RouteHandleDestroy
+        use HCO_DirectRegrid_Mod, only: HCO_DirectRegrid_Reset
 !
 ! !OUTPUT PARAMETERS:
 !
@@ -798,8 +867,12 @@ contains
                 call ESMF_GridDestroy(cache(n)%srcGrid, rc=esmf_rc)
                 cache(n)%initialized = .false.
             endif
+            if (allocated(cache(n)%lonEdges)) deallocate(cache(n)%lonEdges)
+            if (allocated(cache(n)%latEdges)) deallocate(cache(n)%latEdges)
         enddo
         nCached = 0
+
+        call HCO_DirectRegrid_Reset()
 
     end subroutine HCO_RegridCache_Cleanup
 !EOC
